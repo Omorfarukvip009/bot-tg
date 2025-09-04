@@ -44,8 +44,6 @@ const loadBalances = () => readJSON(BALANCE_FILE);
 const saveBalances = (d) => writeJSON(BALANCE_FILE, d);
 const loadWithdraws = () => readJSON(WITHDRAW_FILE);
 const saveWithdraws = (d) => writeJSON(WITHDRAW_FILE, d);
-const loadPending = () => readJSON(PENDING_SESS_FILE);
-const savePending = (d) => writeJSON(PENDING_SESS_FILE, d);
 
 const uid = () => crypto.randomBytes(8).toString("hex");
 
@@ -72,10 +70,6 @@ function detectCountryByPrefix(phone) {
 function getUserInfo(ctx) {
   const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
   return `${name} ${ctx.from.username ? `@${ctx.from.username}` : ""} (ID:${ctx.from.id})`;
-}
-function generateRandomPassword(len = 16) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-  return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
 }
 
 // ========= BOT =========
@@ -186,7 +180,6 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Auth
 function auth(req, res, next) {
   const h = req.headers.authorization || "";
   const [u, p] = Buffer.from((h.split(" ")[1] || ""), "base64").toString().split(":");
@@ -199,44 +192,78 @@ app.get("/", auth, (req, res) => {
   const countries = loadCountries();
   const balances = loadBalances();
   const withdraws = loadWithdraws();
-  const pending = loadPending();
 
   res.send(`
-  <html>
-  <head><title>Admin Panel</title></head>
-  <body>
-    <h1>🤖 Bot Admin Panel</h1>
-    <h2>🌍 Country Settings</h2>
-    <form method="POST" action="/set-country">
-      <input name="prefix" placeholder="+1" required/>
-      <input name="country" placeholder="Country" required/>
-      <select name="allowed"><option value="true">Allowed</option><option value="false">Blocked</option></select>
-      <input name="rate" type="number" step="0.01" placeholder="Rate" required/>
-      <input name="confirmation_time" type="number" placeholder="Confirm(min)" required/>
-      <button type="submit">Save</button>
-    </form>
-    <pre>${JSON.stringify(countries, null, 2)}</pre>
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Bot Admin Panel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body { background:#f9fafb; }
+      form, table { transition: all 0.3s ease; }
+      form:hover { transform: scale(1.02); box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+      tr:hover { background:#f1f5f9; }
+    </style>
+  </head>
+  <body class="p-4">
+    <h1 class="text-3xl font-bold text-gray-800 mb-4">🤖 Bot Admin Panel</h1>
 
-    <h2>💰 Balances</h2>
-    <pre>${JSON.stringify(balances, null, 2)}</pre>
+    <div class="bg-white p-4 rounded-xl shadow mb-6">
+      <h2 class="text-xl font-semibold mb-2">🌍 Country Settings</h2>
+      <form method="POST" action="/set-country" class="flex flex-wrap gap-2">
+        <input name="prefix" placeholder="+1" required class="border rounded p-2 flex-1"/>
+        <input name="country" placeholder="Country" required class="border rounded p-2 flex-1"/>
+        <select name="allowed" class="border rounded p-2">
+          <option value="true">Allowed</option>
+          <option value="false">Blocked</option>
+        </select>
+        <input name="rate" type="number" step="0.01" placeholder="Rate" required class="border rounded p-2 w-28"/>
+        <input name="confirmation_time" type="number" placeholder="Confirm(min)" required class="border rounded p-2 w-32"/>
+        <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">Save</button>
+      </form>
+      <pre class="mt-3 bg-gray-100 p-3 rounded">${JSON.stringify(countries, null, 2)}</pre>
+    </div>
 
-    <h2>💸 Withdraw Requests</h2>
-    <table border="1" cellpadding="5">
-    ${(withdraws.requests||[]).map(r => `
-      <tr>
-        <td>${r.id}</td><td>${r.user_id}</td><td>${r.card}</td>
-        <td>$${r.amount}</td><td>${r.status}${r.txid ? `<br><small>TX:${r.txid}</small>` : ""}</td>
-        <td>${r.date}</td>
-        <td>
-          ${r.status === "pending" ? `
-          <form method="POST" action="/withdraw/${r.id}/approve">
-            <input name="txid" placeholder="Txn ID" required/>
-            <button>Approve</button>
-          </form>
-          <form method="POST" action="/withdraw/${r.id}/reject"><button>Reject</button></form>` : ""}
-        </td>
-      </tr>`).join("")}
-    </table>
+    <div class="bg-white p-4 rounded-xl shadow mb-6">
+      <h2 class="text-xl font-semibold mb-2">💰 Balances</h2>
+      <pre class="bg-gray-100 p-3 rounded">${JSON.stringify(balances, null, 2)}</pre>
+    </div>
+
+    <div class="bg-white p-4 rounded-xl shadow">
+      <h2 class="text-xl font-semibold mb-2">💸 Withdraw Requests</h2>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border border-gray-200 rounded-lg overflow-hidden">
+          <thead class="bg-gray-200">
+            <tr><th class="p-2">ID</th><th>User</th><th>Card</th><th>Amount</th><th>Status</th><th>Date</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+          ${(withdraws.requests||[]).map(r => `
+            <tr class="border-b">
+              <td class="p-2">${r.id}</td>
+              <td class="p-2">${r.user_id}</td>
+              <td class="p-2">${r.card}</td>
+              <td class="p-2 text-green-600 font-semibold">$${r.amount}</td>
+              <td class="p-2">${r.status}${r.txid ? `<br><span class="text-sm text-gray-600">TX:${r.txid}</span>` : ""}</td>
+              <td class="p-2">${r.date}</td>
+              <td class="p-2">
+                ${r.status === "pending" ? `
+                  <form method="POST" action="/withdraw/${r.id}/approve" class="flex flex-col gap-1">
+                    <input name="txid" placeholder="Txn ID" required class="border p-1 rounded"/>
+                    <button class="bg-green-500 hover:bg-green-600 text-white rounded px-2 py-1">Approve</button>
+                  </form>
+                  <form method="POST" action="/withdraw/${r.id}/reject">
+                    <button class="bg-red-500 hover:bg-red-600 text-white rounded px-2 py-1 mt-1 w-full">Reject</button>
+                  </form>
+                ` : ""}
+              </td>
+            </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
   </body>
   </html>
   `);
