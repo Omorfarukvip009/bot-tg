@@ -1,15 +1,19 @@
 {
-  "name": "telegram-session-bot",
+  "name": "telegram-session-buyer",
   "version": "1.0.0",
+  "description": "Telegram bot to buy Telegram sessions from users with admin panel + MongoDB",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.15.3",
-    "express": "^4.18.3",
-    "dotenv": "^16.4.1",
-    "body-parser": "^1.20.2"
+    "body-parser": "^1.20.3",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-session": "^1.17.3",
+    "mongodb": "^6.8.0",
+    "telegraf": "^4.15.3"
   }
 }
