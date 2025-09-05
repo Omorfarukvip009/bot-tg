@@ -19,6 +19,7 @@ const {
   DB_NAME = "telegramBot",
   PORT = 3000,
   SESSION_SECRET = "supersecret",
+  RENDER_EXTERNAL_URL
 } = process.env;
 
 const ADMIN_USER = "FrkBzy001";
@@ -63,10 +64,6 @@ async function addBalance(userId, name, amount) {
   );
   return res.value.balance;
 }
-async function deductBalance(userId, amt) {
-  const d = await connectDB();
-  await d.collection("balances").updateOne({ user_id: userId }, { $inc: { balance: -amt } });
-}
 async function addWithdrawRequest(data) {
   const d = await connectDB();
   await d.collection("withdraws").insertOne(data);
@@ -104,7 +101,7 @@ bot.start((ctx) => {
   if (ctx.chat.type !== "private") return;
   userState[ctx.chat.id] = {};
   ctx.reply(
-    "👋 স্বাগতম!\nআমাদের সাথে আপনার টেলিগ্রাম সেশন বিক্রি করতে ফোন নাম্বার পাঠান (যেমন: +১...) অথবা নিচের অপশন ব্যবহার করুন।",
+    "👋 স্বাগতম!\nআমাদের সাথে আপনার টেলিগ্রাম সেশন বিক্রি করতে ফোন নাম্বার পাঠান অথবা নিচের অপশন ব্যবহার করুন।",
     mainKeyboard
   );
 });
@@ -149,7 +146,7 @@ bot.on("text", async (ctx) => {
       date: new Date().toISOString(),
     });
     userState[userId] = {};
-    ctx.reply(`✅ আপনার টাকা তোলার অনুরোধ (#${id}) গৃহীত হয়েছে। Admin অনুমোদন দিলে আপনি টাকা পাবেন।`, mainKeyboard);
+    ctx.reply(`✅ আপনার টাকা তোলার অনুরোধ (#${id}) গৃহীত হয়েছে।`, mainKeyboard);
     return;
   }
 
@@ -199,8 +196,7 @@ app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: true
 app.get("/", (req, res) => {
   if (!req.session.loggedIn) {
     return res.send(`
-      <html><head><title>Login</title>
-      <script src="https://cdn.tailwindcss.com"></script></head>
+      <html><head><title>Login</title><script src="https://cdn.tailwindcss.com"></script></head>
       <body class="bg-gray-100 flex items-center justify-center h-screen">
         <form method="POST" action="/login" class="bg-white p-6 rounded shadow-md space-y-4 w-80">
           <h1 class="text-2xl font-bold text-center">🔑 Admin Login</h1>
@@ -230,39 +226,32 @@ app.get("/panel", async (req, res) => {
   const withdraws = await getWithdraws();
 
   res.send(`
-  <html>
-  <head><title>Admin Panel</title><script src="https://cdn.tailwindcss.com"></script></head>
+  <html><head><title>Admin Panel</title><script src="https://cdn.tailwindcss.com"></script></head>
   <body class="bg-gray-50 p-6">
     <h1 class="text-3xl font-bold mb-6">🤖 সেশন বিক্রির Admin Panel</h1>
-
     <div class="bg-white p-4 rounded-xl shadow mb-6">
       <h2 class="text-xl font-semibold mb-2">🌍 দেশ সেটিংস</h2>
       <form method="POST" action="/set-country" class="flex flex-wrap gap-2">
         <input name="prefix" placeholder="+1" required class="border p-2 rounded"/>
         <input name="country" placeholder="Country" required class="border p-2 rounded"/>
-        <select name="allowed" class="border p-2 rounded">
-          <option value="true">Allowed</option><option value="false">Blocked</option>
-        </select>
+        <select name="allowed" class="border p-2 rounded"><option value="true">Allowed</option><option value="false">Blocked</option></select>
         <input name="rate" type="number" step="0.01" placeholder="Rate" required class="border p-2 rounded w-24"/>
         <input name="confirmation_time" type="number" placeholder="Confirm(min)" required class="border p-2 rounded w-32"/>
         <button class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded">Save</button>
       </form>
       <pre class="bg-gray-100 p-3 mt-3 rounded">${JSON.stringify(countries, null, 2)}</pre>
     </div>
-
     <div class="bg-white p-4 rounded-xl shadow mb-6">
       <h2 class="text-xl font-semibold mb-2">💰 Seller Earnings</h2>
       <pre class="bg-gray-100 p-3 rounded">${JSON.stringify(balances, null, 2)}</pre>
     </div>
-
     <div class="bg-white p-4 rounded-xl shadow">
       <h2 class="text-xl font-semibold mb-2">💸 Withdraw Requests</h2>
       <table class="w-full border">
         ${withdraws.map(w => `
         <tr>
           <td>${w.id}</td><td>${w.user_id}</td><td>${w.card}</td><td>$${w.amount}</td><td>${w.status}</td>
-          <td>
-            ${w.status === "pending" ? `
+          <td>${w.status === "pending" ? `
             <form method="POST" action="/withdraw/${w.id}/approve">
               <input name="txid" placeholder="Txn ID" required class="border p-1 rounded"/>
               <button class="bg-green-500 hover:bg-green-600 text-white px-2 py-1 rounded">Approve</button>
@@ -274,8 +263,7 @@ app.get("/panel", async (req, res) => {
         </tr>`).join("")}
       </table>
     </div>
-  </body>
-  </html>
+  </body></html>
   `);
 });
 
@@ -299,9 +287,9 @@ app.post("/withdraw/:id/reject", async (req, res) => {
   res.redirect("/panel");
 });
 
-// ========= START =========
-connectDB().then(() => {
-  app.listen(PORT, () => console.log(`🌐 Admin Panel running on port ${PORT}`));
-  bot.launch();
-  console.log("🚀 Bot running with MongoDB...");
+// ========= WEBHOOK START =========
+connectDB().then(async () => {
+  app.use(await bot.createWebhook({ domain: RENDER_EXTERNAL_URL, path: "/webhook" }));
+  app.listen(PORT, () => console.log(`🌐 Admin Panel running on ${PORT}`));
+  console.log(`🚀 Bot running in Webhook mode at ${RENDER_EXTERNAL_URL}/webhook`);
 });
