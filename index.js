@@ -1,75 +1,92 @@
 import { Telegraf } from "telegraf";
 import { exec } from "child_process";
-import fs from "fs";
-import path from "path";
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import crypto from "crypto";
+import { MongoClient } from "mongodb";
+import session from "express-session";
 
 dotenv.config();
 
 // ========= ENV =========
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const API_ID = process.env.API_ID;
-const API_HASH = process.env.API_HASH;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
-const PORT = process.env.PORT || 3000;
+const {
+  BOT_TOKEN,
+  API_ID,
+  API_HASH,
+  ADMIN_CHAT_ID,
+  MONGO_URI,
+  DB_NAME = "telegramBot",
+  PORT = 3000,
+  SESSION_SECRET = "supersecret",
+} = process.env;
 
-const DATA_DIR = process.env.DATA_DIR || "./data";
-const COUNTRY_FILE = path.join(DATA_DIR, "allowed_countries.json");
-const BALANCE_FILE = path.join(DATA_DIR, "balances.json");
-const WITHDRAW_FILE = path.join(DATA_DIR, "withdraw_requests.json");
-const PENDING_SESS_FILE = path.join(DATA_DIR, "pending_sessions.json");
-
-// Admin Panel Auth
 const ADMIN_USER = "FrkBzy001";
 const ADMIN_PASS = "Omorfaruk00";
 
-// ========= FS =========
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-for (const f of [COUNTRY_FILE, BALANCE_FILE, WITHDRAW_FILE, PENDING_SESS_FILE]) {
-  if (!fs.existsSync(f)) {
-    fs.writeFileSync(f, JSON.stringify(f.includes("withdraw") ? { requests: [] } : {}, null, 2));
+// ========= MONGO =========
+const client = new MongoClient(MONGO_URI);
+let db;
+async function connectDB() {
+  if (!db) {
+    await client.connect();
+    db = client.db(DB_NAME);
+    console.log("✅ MongoDB connected!");
   }
+  return db;
 }
 
 // ========= UTIL =========
-const readJSON = (f) => { try { return JSON.parse(fs.readFileSync(f)); } catch { return {}; } };
-const writeJSON = (f, d) => fs.writeFileSync(f, JSON.stringify(d, null, 2));
-
-const loadCountries = () => readJSON(COUNTRY_FILE);
-const saveCountries = (d) => writeJSON(COUNTRY_FILE, d);
-const loadBalances = () => readJSON(BALANCE_FILE);
-const saveBalances = (d) => writeJSON(BALANCE_FILE, d);
-const loadWithdraws = () => readJSON(WITHDRAW_FILE);
-const saveWithdraws = (d) => writeJSON(WITHDRAW_FILE, d);
-
 const uid = () => crypto.randomBytes(8).toString("hex");
 
-function addBalance(uid, name, amount) {
-  const b = loadBalances();
-  if (!b[uid]) b[uid] = { name, balance: 0 };
-  b[uid].balance = Number((b[uid].balance + Number(amount)).toFixed(6));
-  saveBalances(b);
-  return b[uid].balance;
+async function loadCountries() {
+  const d = await connectDB();
+  const docs = await d.collection("countries").find({}).toArray();
+  const obj = {};
+  docs.forEach((c) => (obj[c.prefix] = c));
+  return obj;
 }
-function deductBalance(uid, amt) {
-  const b = loadBalances();
-  if (!b[uid]) return 0;
-  b[uid].balance = Math.max(0, b[uid].balance - amt);
-  saveBalances(b);
-  return b[uid].balance;
+async function saveCountry(prefix, data) {
+  const d = await connectDB();
+  await d.collection("countries").updateOne({ prefix }, { $set: { ...data, prefix } }, { upsert: true });
 }
-function detectCountryByPrefix(phone) {
-  const c = loadCountries();
-  const keys = Object.keys(c).sort((a, b) => b.length - a.length);
+async function getBalance(userId) {
+  const d = await connectDB();
+  return (await d.collection("balances").findOne({ user_id: userId })) || { balance: 0 };
+}
+async function addBalance(userId, name, amount) {
+  const d = await connectDB();
+  const res = await d.collection("balances").findOneAndUpdate(
+    { user_id: userId },
+    { $set: { name }, $inc: { balance: Number(amount) } },
+    { upsert: true, returnDocument: "after" }
+  );
+  return res.value.balance;
+}
+async function deductBalance(userId, amt) {
+  const d = await connectDB();
+  await d.collection("balances").updateOne({ user_id: userId }, { $inc: { balance: -amt } });
+}
+async function addWithdrawRequest(data) {
+  const d = await connectDB();
+  await d.collection("withdraws").insertOne(data);
+}
+async function getWithdraws() {
+  const d = await connectDB();
+  return await d.collection("withdraws").find({}).toArray();
+}
+async function updateWithdrawStatus(id, status, txid) {
+  const d = await connectDB();
+  await d.collection("withdraws").updateOne({ id }, { $set: { status, txid } });
+}
+function detectCountryByPrefix(phone, countries) {
+  const keys = Object.keys(countries).sort((a, b) => b.length - a.length);
   const match = keys.find((k) => phone.startsWith(k));
-  return match ? { prefix: match, ...c[match] } : null;
+  return match ? countries[match] : null;
 }
-function getUserInfo(ctx) {
+function userLabel(ctx) {
   const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
-  return `${name} ${ctx.from.username ? `@${ctx.from.username}` : ""} (ID:${ctx.from.id})`;
+  return `${name || "Unknown"} ${ctx.from.username ? `@${ctx.from.username}` : ""} (ID:${ctx.from.id})`;
 }
 
 // ========= BOT =========
@@ -78,7 +95,7 @@ const userState = {};
 
 const mainKeyboard = {
   reply_markup: {
-    keyboard: [["💲 BALANCE", "💸 WITHDRAW", "📜 WITHDRAW HISTORY"]],
+    keyboard: [["💲 আমার আয়", "💸 টাকা তুলুন", "📜 বিক্রির ইতিহাস"]],
     resize_keyboard: true,
   },
 };
@@ -86,42 +103,43 @@ const mainKeyboard = {
 bot.start((ctx) => {
   if (ctx.chat.type !== "private") return;
   userState[ctx.chat.id] = {};
-  ctx.reply("👋 Welcome! Send phone number or choose option:", mainKeyboard);
+  ctx.reply(
+    "👋 স্বাগতম!\nআমাদের সাথে আপনার টেলিগ্রাম সেশন বিক্রি করতে ফোন নাম্বার পাঠান (যেমন: +১...) অথবা নিচের অপশন ব্যবহার করুন।",
+    mainKeyboard
+  );
 });
 
-bot.hears("💲 BALANCE", (ctx) => {
-  const b = loadBalances();
-  ctx.reply(`💰 Balance: $${(b[ctx.chat.id]?.balance || 0).toFixed(2)}`, mainKeyboard);
+bot.hears("💲 আমার আয়", async (ctx) => {
+  const b = await getBalance(ctx.chat.id);
+  ctx.reply(`💰 আপনার মোট আয়: $${(b.balance || 0).toFixed(2)}`, mainKeyboard);
 });
 
-bot.hears("💸 WITHDRAW", (ctx) => {
+bot.hears("💸 টাকা তুলুন", (ctx) => {
   userState[ctx.chat.id] = { step: "withdraw_card" };
-  ctx.reply("💳 Enter Leader Card:", mainKeyboard);
+  ctx.reply("💳 টাকা তোলার জন্য আপনার লিডার কার্ড লিখুন:", mainKeyboard);
 });
 
-bot.hears("📜 WITHDRAW HISTORY", (ctx) => {
-  const all = loadWithdraws().requests;
+bot.hears("📜 বিক্রির ইতিহাস", async (ctx) => {
+  const all = await getWithdraws();
   const mine = all.filter((x) => x.user_id === ctx.chat.id);
-  if (!mine.length) return ctx.reply("📭 No history found.", mainKeyboard);
+  if (!mine.length) return ctx.reply("📭 কোনো ইতিহাস নেই।", mainKeyboard);
   ctx.reply(mine.map((r) => `#${r.id} • $${r.amount} • ${r.status}`).join("\n"), mainKeyboard);
 });
 
-bot.on("text", (ctx) => {
+bot.on("text", async (ctx) => {
   const userId = ctx.chat.id;
   const msg = ctx.message.text.trim();
 
-  // Withdraw flow
   if (userState[userId]?.step === "withdraw_card") {
     userState[userId].card = msg;
     userState[userId].step = "withdraw_amt";
-    return ctx.reply("💸 Enter amount (USD):", mainKeyboard);
+    return ctx.reply("💸 কত টাকা তুলতে চান (USD):", mainKeyboard);
   }
   if (userState[userId]?.step === "withdraw_amt") {
     const amt = Number(msg);
-    if (!amt) return ctx.reply("❌ Invalid amount.");
-    const wr = loadWithdraws();
+    if (!amt) return ctx.reply("❌ পরিমাণ সঠিক নয়।");
     const id = uid();
-    wr.requests.push({
+    await addWithdrawRequest({
       id,
       user_id: userId,
       username: ctx.from.username || "",
@@ -130,188 +148,160 @@ bot.on("text", (ctx) => {
       status: "pending",
       date: new Date().toISOString(),
     });
-    saveWithdraws(wr);
     userState[userId] = {};
-    ctx.reply(`✅ Withdraw request #${id} submitted.`, mainKeyboard);
+    ctx.reply(`✅ আপনার টাকা তোলার অনুরোধ (#${id}) গৃহীত হয়েছে। Admin অনুমোদন দিলে আপনি টাকা পাবেন।`, mainKeyboard);
     return;
   }
 
-  // Phone number
   if (msg.startsWith("+")) {
-    const country = detectCountryByPrefix(msg);
+    const countries = await loadCountries();
+    const country = detectCountryByPrefix(msg, countries);
     if (!country?.allowed) {
-      return ctx.reply(`❌ Your country (${country?.country || "Unknown"}) is off.`, mainKeyboard);
+      return ctx.reply(`🚫 বর্তমানে ${country?.country || "আপনার দেশ"} থেকে সেশন বিক্রি বন্ধ আছে।`, mainKeyboard);
     }
-    ctx.reply("📲 Sending OTP...");
-    const cmd = `python3 session.py ${API_ID} ${API_HASH} ${msg} request`;
-    exec(cmd, (err, stdout) => {
-      if (err || !String(stdout).includes("CODE_REQUESTED"))
-        return ctx.reply("❌ OTP failed.");
+    ctx.reply("📲 আপনার নম্বরে OTP পাঠানো হচ্ছে...");
+    exec(`python3 session.py ${API_ID} ${API_HASH} ${msg} request`, (err, stdout) => {
+      if (err || !String(stdout).includes("CODE_REQUESTED")) {
+        return ctx.reply("❌ OTP পাঠানো ব্যর্থ।", mainKeyboard);
+      }
       userState[userId] = { phone: msg, waitingForOtp: true, rate: country.rate };
-      ctx.reply("✅ Enter OTP:", mainKeyboard);
+      ctx.reply("✅ OTP পাঠানো হয়েছে। দয়া করে লিখুন:", mainKeyboard);
     });
     return;
   }
 
   if (userState[userId]?.waitingForOtp) {
-    ctx.reply("⏳ Verifying...");
+    ctx.reply("⏳ আপনার সেশন যাচাই হচ্ছে...");
     const { phone, rate } = userState[userId];
-    const cmd = `python3 session.py ${API_ID} ${API_HASH} ${phone} otp=${msg}`;
-    exec(cmd, async (err, stdout) => {
-      if (err) return ctx.reply("❌ OTP verify failed.");
-      if (!String(stdout).includes("SESSION_FILE"))
-        return ctx.reply("❌ Session create failed.");
-      const newBal = addBalance(userId, ctx.from.first_name, rate);
-      ctx.reply(`✅ Session ok! Balance: $${newBal.toFixed(2)}`, mainKeyboard);
+    exec(`python3 session.py ${API_ID} ${API_HASH} ${phone} otp=${msg}`, async (err, stdout) => {
+      if (err) return ctx.reply("❌ OTP যাচাই ব্যর্থ।");
+      if (!String(stdout).includes("SESSION_FILE")) return ctx.reply("❌ সেশন তৈরি ব্যর্থ।");
+      const newBal = await addBalance(userId, ctx.from.first_name, rate);
+      ctx.reply(`✅ আপনার সেশন গৃহীত হয়েছে!\n💵 নতুন ব্যালেন্স: $${newBal.toFixed(2)}`, mainKeyboard);
       await bot.telegram.sendMessage(
         ADMIN_CHAT_ID,
-        `✅ New session from ${getUserInfo(ctx)}\n📞 ${phone}\n💲 $${rate}`
+        `🆕 নতুন সেশন বিক্রি!\n👤 ${userLabel(ctx)}\n📞 ${phone}\n💲 রেট: $${rate}`
       );
     });
     userState[userId] = {};
     return;
   }
 
-  ctx.reply("❌ Invalid input.", mainKeyboard);
+  ctx.reply("❌ ইনপুট সঠিক নয়।", mainKeyboard);
 });
 
 // ========= ADMIN PANEL =========
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
+app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: true }));
 
-function auth(req, res, next) {
-  const h = req.headers.authorization || "";
-  const [u, p] = Buffer.from((h.split(" ")[1] || ""), "base64").toString().split(":");
-  if (u === ADMIN_USER && p === ADMIN_PASS) return next();
-  res.setHeader("WWW-Authenticate", 'Basic realm="Admin Panel"');
-  return res.status(401).send("Authentication required");
-}
+app.get("/", (req, res) => {
+  if (!req.session.loggedIn) {
+    return res.send(`
+      <html><head><title>Login</title>
+      <script src="https://cdn.tailwindcss.com"></script></head>
+      <body class="bg-gray-100 flex items-center justify-center h-screen">
+        <form method="POST" action="/login" class="bg-white p-6 rounded shadow-md space-y-4 w-80">
+          <h1 class="text-2xl font-bold text-center">🔑 Admin Login</h1>
+          <input type="text" name="username" placeholder="Username" class="border p-2 w-full rounded" required/>
+          <input type="password" name="password" placeholder="Password" class="border p-2 w-full rounded" required/>
+          <button class="bg-blue-600 hover:bg-blue-700 text-white w-full py-2 rounded">Login</button>
+        </form>
+      </body></html>
+    `);
+  }
+  res.redirect("/panel");
+});
 
-app.get("/", auth, (req, res) => {
-  const countries = loadCountries();
-  const balances = loadBalances();
-  const withdraws = loadWithdraws();
+app.post("/login", (req, res) => {
+  const { username, password } = req.body;
+  if (username === ADMIN_USER && password === ADMIN_PASS) {
+    req.session.loggedIn = true;
+    return res.redirect("/panel");
+  }
+  res.send("❌ Wrong username or password.");
+});
+
+app.get("/panel", async (req, res) => {
+  if (!req.session.loggedIn) return res.redirect("/");
+  const countries = await loadCountries();
+  const balances = await connectDB().then((d) => d.collection("balances").find({}).toArray());
+  const withdraws = await getWithdraws();
 
   res.send(`
-  <!DOCTYPE html>
-  <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Bot Admin Panel</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-      body { background:#f9fafb; }
-      form, table { transition: all 0.3s ease; }
-      form:hover { transform: scale(1.02); box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-      tr:hover { background:#f1f5f9; }
-    </style>
-  </head>
-  <body class="p-4">
-    <h1 class="text-3xl font-bold text-gray-800 mb-4">🤖 Bot Admin Panel</h1>
+  <html>
+  <head><title>Admin Panel</title><script src="https://cdn.tailwindcss.com"></script></head>
+  <body class="bg-gray-50 p-6">
+    <h1 class="text-3xl font-bold mb-6">🤖 সেশন বিক্রির Admin Panel</h1>
 
     <div class="bg-white p-4 rounded-xl shadow mb-6">
-      <h2 class="text-xl font-semibold mb-2">🌍 Country Settings</h2>
+      <h2 class="text-xl font-semibold mb-2">🌍 দেশ সেটিংস</h2>
       <form method="POST" action="/set-country" class="flex flex-wrap gap-2">
-        <input name="prefix" placeholder="+1" required class="border rounded p-2 flex-1"/>
-        <input name="country" placeholder="Country" required class="border rounded p-2 flex-1"/>
-        <select name="allowed" class="border rounded p-2">
-          <option value="true">Allowed</option>
-          <option value="false">Blocked</option>
+        <input name="prefix" placeholder="+1" required class="border p-2 rounded"/>
+        <input name="country" placeholder="Country" required class="border p-2 rounded"/>
+        <select name="allowed" class="border p-2 rounded">
+          <option value="true">Allowed</option><option value="false">Blocked</option>
         </select>
-        <input name="rate" type="number" step="0.01" placeholder="Rate" required class="border rounded p-2 w-28"/>
-        <input name="confirmation_time" type="number" placeholder="Confirm(min)" required class="border rounded p-2 w-32"/>
-        <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">Save</button>
+        <input name="rate" type="number" step="0.01" placeholder="Rate" required class="border p-2 rounded w-24"/>
+        <input name="confirmation_time" type="number" placeholder="Confirm(min)" required class="border p-2 rounded w-32"/>
+        <button class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded">Save</button>
       </form>
-      <pre class="mt-3 bg-gray-100 p-3 rounded">${JSON.stringify(countries, null, 2)}</pre>
+      <pre class="bg-gray-100 p-3 mt-3 rounded">${JSON.stringify(countries, null, 2)}</pre>
     </div>
 
     <div class="bg-white p-4 rounded-xl shadow mb-6">
-      <h2 class="text-xl font-semibold mb-2">💰 Balances</h2>
+      <h2 class="text-xl font-semibold mb-2">💰 Seller Earnings</h2>
       <pre class="bg-gray-100 p-3 rounded">${JSON.stringify(balances, null, 2)}</pre>
     </div>
 
     <div class="bg-white p-4 rounded-xl shadow">
       <h2 class="text-xl font-semibold mb-2">💸 Withdraw Requests</h2>
-      <div class="overflow-x-auto">
-        <table class="w-full text-left border border-gray-200 rounded-lg overflow-hidden">
-          <thead class="bg-gray-200">
-            <tr><th class="p-2">ID</th><th>User</th><th>Card</th><th>Amount</th><th>Status</th><th>Date</th><th>Action</th></tr>
-          </thead>
-          <tbody>
-          ${(withdraws.requests||[]).map(r => `
-            <tr class="border-b">
-              <td class="p-2">${r.id}</td>
-              <td class="p-2">${r.user_id}</td>
-              <td class="p-2">${r.card}</td>
-              <td class="p-2 text-green-600 font-semibold">$${r.amount}</td>
-              <td class="p-2">${r.status}${r.txid ? `<br><span class="text-sm text-gray-600">TX:${r.txid}</span>` : ""}</td>
-              <td class="p-2">${r.date}</td>
-              <td class="p-2">
-                ${r.status === "pending" ? `
-                  <form method="POST" action="/withdraw/${r.id}/approve" class="flex flex-col gap-1">
-                    <input name="txid" placeholder="Txn ID" required class="border p-1 rounded"/>
-                    <button class="bg-green-500 hover:bg-green-600 text-white rounded px-2 py-1">Approve</button>
-                  </form>
-                  <form method="POST" action="/withdraw/${r.id}/reject">
-                    <button class="bg-red-500 hover:bg-red-600 text-white rounded px-2 py-1 mt-1 w-full">Reject</button>
-                  </form>
-                ` : ""}
-              </td>
-            </tr>`).join("")}
-          </tbody>
-        </table>
-      </div>
+      <table class="w-full border">
+        ${withdraws.map(w => `
+        <tr>
+          <td>${w.id}</td><td>${w.user_id}</td><td>${w.card}</td><td>$${w.amount}</td><td>${w.status}</td>
+          <td>
+            ${w.status === "pending" ? `
+            <form method="POST" action="/withdraw/${w.id}/approve">
+              <input name="txid" placeholder="Txn ID" required class="border p-1 rounded"/>
+              <button class="bg-green-500 hover:bg-green-600 text-white px-2 py-1 rounded">Approve</button>
+            </form>
+            <form method="POST" action="/withdraw/${w.id}/reject">
+              <button class="bg-red-500 hover:bg-red-600 text-white px-2 py-1 rounded">Reject</button>
+            </form>` : ""}
+          </td>
+        </tr>`).join("")}
+      </table>
     </div>
   </body>
   </html>
   `);
 });
 
-app.post("/set-country", auth, (req, res) => {
-  const data = loadCountries();
-  data[req.body.prefix] = {
+app.post("/set-country", async (req, res) => {
+  await saveCountry(req.body.prefix, {
     country: req.body.country,
     allowed: req.body.allowed === "true",
     rate: Number(req.body.rate),
     confirmation_time: Number(req.body.confirmation_time),
-  };
-  saveCountries(data);
-  res.redirect("/");
+  });
+  res.redirect("/panel");
 });
 
-app.post("/withdraw/:id/approve", auth, async (req, res) => {
-  const w = loadWithdraws();
-  const r = w.requests.find(x => x.id === req.params.id);
-  if (r && r.status === "pending") {
-    deductBalance(r.user_id, r.amount);
-    r.status = "approved";
-    r.txid = req.body.txid || "N/A";
-    saveWithdraws(w);
-    await bot.telegram.sendMessage(r.user_id, `✅ Withdraw Approved\n💸 $${r.amount}\n🔑 TX: ${r.txid}`);
-  }
-  res.redirect("/");
+app.post("/withdraw/:id/approve", async (req, res) => {
+  await updateWithdrawStatus(req.params.id, "approved", req.body.txid);
+  res.redirect("/panel");
 });
 
-app.post("/withdraw/:id/reject", auth, async (req, res) => {
-  const w = loadWithdraws();
-  const r = w.requests.find(x => x.id === req.params.id);
-  if (r && r.status === "pending") {
-    r.status = "rejected";
-    saveWithdraws(w);
-    await bot.telegram.sendMessage(r.user_id, `❌ Withdraw Rejected\n💸 $${r.amount}`);
-  }
-  res.redirect("/");
-});
-
-// ✅ Redirect Fix
-app.use((req, res) => {
-  if (req.path === "/") return res.status(404).send("404 Not Found");
-  return res.redirect("/");
+app.post("/withdraw/:id/reject", async (req, res) => {
+  await updateWithdrawStatus(req.params.id, "rejected");
+  res.redirect("/panel");
 });
 
 // ========= START =========
-app.listen(PORT, () => console.log(`🌐 Admin Panel running at :${PORT}`));
-bot.launch();
-console.log("🚀 Bot running...");
+connectDB().then(() => {
+  app.listen(PORT, () => console.log(`🌐 Admin Panel running on port ${PORT}`));
+  bot.launch();
+  console.log("🚀 Bot running with MongoDB...");
+});
