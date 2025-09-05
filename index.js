@@ -1,11 +1,13 @@
 import { Telegraf } from "telegraf";
 import { exec } from "child_process";
+import fs from "fs";
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { MongoClient } from "mongodb";
 import session from "express-session";
+import JSZip from "jszip";
 
 dotenv.config();
 
@@ -64,6 +66,10 @@ async function addBalance(userId, name, amount) {
   );
   return res.value.balance;
 }
+async function deductBalance(userId, amt) {
+  const d = await connectDB();
+  await d.collection("balances").updateOne({ user_id: userId }, { $inc: { balance: -amt } });
+}
 async function addWithdrawRequest(data) {
   const d = await connectDB();
   await d.collection("withdraws").insertOne(data);
@@ -72,10 +78,33 @@ async function getWithdraws() {
   const d = await connectDB();
   return await d.collection("withdraws").find({}).toArray();
 }
+async function getWithdrawById(id) {
+  const d = await connectDB();
+  return await d.collection("withdraws").findOne({ id });
+}
 async function updateWithdrawStatus(id, status, txid) {
   const d = await connectDB();
   await d.collection("withdraws").updateOne({ id }, { $set: { status, txid } });
 }
+
+// ========= SESSION DB =========
+async function saveSessionToDB(phone, fileBuffer) {
+  const d = await connectDB();
+  await d.collection("sessions").insertOne({
+    phone,
+    file: fileBuffer.toString("base64"),
+    date: new Date().toISOString()
+  });
+}
+async function getSessions() {
+  const d = await connectDB();
+  return await d.collection("sessions").find({}).toArray();
+}
+async function clearSessions() {
+  const d = await connectDB();
+  await d.collection("sessions").deleteMany({});
+}
+
 function detectCountryByPrefix(phone, countries) {
   const keys = Object.keys(countries).sort((a, b) => b.length - a.length);
   const match = keys.find((k) => phone.startsWith(k));
@@ -173,6 +202,11 @@ bot.on("text", async (ctx) => {
     exec(`python3 session.py ${API_ID} ${API_HASH} ${phone} otp=${msg}`, async (err, stdout) => {
       if (err) return ctx.reply("❌ OTP যাচাই ব্যর্থ।");
       if (!String(stdout).includes("SESSION_FILE")) return ctx.reply("❌ সেশন তৈরি ব্যর্থ।");
+      const filePath = `${phone}.session`;
+      if (fs.existsSync(filePath)) {
+        const buffer = fs.readFileSync(filePath);
+        await saveSessionToDB(phone, buffer); // ✅ save in DB
+      }
       const newBal = await addBalance(userId, ctx.from.first_name, rate);
       ctx.reply(`✅ আপনার সেশন গৃহীত হয়েছে!\n💵 নতুন ব্যালেন্স: $${newBal.toFixed(2)}`, mainKeyboard);
       await bot.telegram.sendMessage(
@@ -224,11 +258,22 @@ app.get("/panel", async (req, res) => {
   const countries = await loadCountries();
   const balances = await connectDB().then((d) => d.collection("balances").find({}).toArray());
   const withdraws = await getWithdraws();
+  const sessions = await getSessions();
 
   res.send(`
   <html><head><title>Admin Panel</title><script src="https://cdn.tailwindcss.com"></script></head>
   <body class="bg-gray-50 p-6">
     <h1 class="text-3xl font-bold mb-6">🤖 সেশন বিক্রির Admin Panel</h1>
+    <div class="bg-white p-4 rounded-xl shadow mb-6">
+      <h2 class="text-xl font-semibold mb-2">📦 Saved Sessions (${sessions.length})</h2>
+      <ul class="list-disc pl-5">${sessions.map(s => `<li>${s.phone}</li>`).join("")}</ul>
+      <form method="GET" action="/download-sessions">
+        <button class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded mt-2">⬇ Download All</button>
+      </form>
+      <form method="POST" action="/clear-sessions">
+        <button class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded mt-2">🗑 Clear Old Sessions</button>
+      </form>
+    </div>
     <div class="bg-white p-4 rounded-xl shadow mb-6">
       <h2 class="text-xl font-semibold mb-2">🌍 দেশ সেটিংস</h2>
       <form method="POST" action="/set-country" class="flex flex-wrap gap-2">
@@ -267,6 +312,25 @@ app.get("/panel", async (req, res) => {
   `);
 });
 
+app.get("/download-sessions", async (req, res) => {
+  if (!req.session.loggedIn) return res.redirect("/");
+  const sessions = await getSessions();
+  const zip = new JSZip();
+  sessions.forEach((s) => {
+    zip.file(`${s.phone}.session`, Buffer.from(s.file, "base64"));
+  });
+  const content = await zip.generateAsync({ type: "nodebuffer" });
+  res.setHeader("Content-Disposition", "attachment; filename=allsessions.zip");
+  res.setHeader("Content-Type", "application/zip");
+  res.send(content);
+});
+
+app.post("/clear-sessions", async (req, res) => {
+  if (!req.session.loggedIn) return res.redirect("/");
+  await clearSessions();
+  res.redirect("/panel");
+});
+
 app.post("/set-country", async (req, res) => {
   await saveCountry(req.body.prefix, {
     country: req.body.country,
@@ -278,7 +342,21 @@ app.post("/set-country", async (req, res) => {
 });
 
 app.post("/withdraw/:id/approve", async (req, res) => {
+  const w = await getWithdrawById(req.params.id);
+  if (!w) return res.redirect("/panel");
+
+  await deductBalance(w.user_id, w.amount);
   await updateWithdrawStatus(req.params.id, "approved", req.body.txid);
+
+  try {
+    await bot.telegram.sendMessage(
+      w.user_id,
+      `✅ আপনার টাকা তোলার অনুরোধ অনুমোদিত!\n💸 পরিমাণ: $${w.amount}\n🔑 TXID: ${req.body.txid}`
+    );
+  } catch (e) {
+    console.log("⚠️ Could not notify user:", e.message);
+  }
+
   res.redirect("/panel");
 });
 
