@@ -1,7 +1,7 @@
 {
   "name": "telegram-session-buyer",
   "version": "1.0.0",
-  "description": "Telegram bot to buy Telegram sessions from users with admin panel + MongoDB",
+  "description": "Telegram bot to buy sessions from users with MongoDB + Admin Panel + Webhook",
   "main": "index.js",
   "type": "module",
   "scripts": {
